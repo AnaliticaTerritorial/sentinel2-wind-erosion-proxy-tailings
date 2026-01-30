@@ -1,0 +1,440 @@
+// =====================================================
+// Erosión eólica / movilización de sedimentos (proxy)
+// Sentinel-2 SR (L2A) + índices NDVI / NDMI / BSI
+// + UI interactiva (año) + KPIs + gráficos adaptativos
+// ROI: usa tu asset o dibuja un polígono llamado "roi"
+// =====================================================
+
+//---------------------------------------------
+// 0) ROI
+//---------------------------------------------
+var roi = ee.FeatureCollection("projects/winged-axon-410813/assets/DEMO_RELAVES");
+Map.centerObject(roi, 12);
+
+//---------------------------------------------
+// 1) Parámetros
+//---------------------------------------------
+var start = '2019-01-01';
+var end   = '2025-12-31';
+
+// Umbrales (ajústalos según tu zona)
+var thrNDVI = 0.20;     // <= 0.2 suele ser poca vegetación
+var thrNDMI = 0.00;     // <= 0 indica seco (depende del lugar)
+var thrBSI  = 0.10;     // >= 0.1 suelo desnudo (ajustable)
+
+// Nubes
+var maxCloud = 40;
+
+//---------------------------------------------
+// 2) Sentinel-2 SR + máscara de nubes (SCL)
+//---------------------------------------------
+function maskS2sr(img) {
+  // Scene Classification Layer (SCL):
+  // 3 = Cloud shadow, 8/9/10 = clouds, 11 = snow/ice
+  var scl = img.select('SCL');
+  var mask = scl.neq(3)
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  // Escala reflectancia (0..1)
+  return img.updateMask(mask).divide(10000)
+    .copyProperties(img, ['system:time_start']);
+}
+
+// Índices
+function addIndices(img) {
+  var ndvi = img.normalizedDifference(['B8','B4']).rename('NDVI');   // veg
+  var ndmi = img.normalizedDifference(['B8','B11']).rename('NDMI');  // humedad (NIR-SWIR1)
+
+  // Bare Soil Index (BSI)
+  var bsi = img.expression(
+    '((swir + red) - (nir + blue)) / ((swir + red) + (nir + blue))', {
+      swir: img.select('B11'),
+      red:  img.select('B4'),
+      nir:  img.select('B8'),
+      blue: img.select('B2')
+    }).rename('BSI');
+
+  // “Potencial de emisión de polvo” (heurístico):
+  // alto si: suelo desnudo (BSI↑), poco NDVI, muy seco (NDMI↓)
+  var dustPotential = bsi
+    .multiply( ee.Image(1).subtract(ndvi) )
+    .multiply( ee.Image(1).subtract(ndmi.add(1).divide(2)) ) // NDMI [-1,1] -> [0,1] e invierte
+    .rename('DUST_POT');
+
+  return img.addBands([ndvi, ndmi, bsi, dustPotential]);
+}
+
+//---------------------------------------------
+// 3) Colección Sentinel-2 (base) + compuestos
+//---------------------------------------------
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(start, end)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', maxCloud))
+  .map(maskS2sr)
+  .map(addIndices);
+
+// Compuesto general (mediana del periodo)
+var comp = s2.median().clip(roi);
+
+// Máscara “superficie erosionable” (proxy)
+var erodible = comp.select('NDVI').lte(thrNDVI)
+  .and(comp.select('NDMI').lte(thrNDMI))
+  .and(comp.select('BSI').gte(thrBSI))
+  .selfMask()
+  .rename('ERODIBLE');
+
+//---------------------------------------------
+// 4) Visualización (capas base)
+//---------------------------------------------
+
+// Paletas de color
+var palNDVI = ['8c510a','d8b365','f6e8c3','c7eae5','5ab4ac','01665e'];
+var palNDMI = ['7f0000','d7301f','fc8d59','fee090','e0f3f8','91bfdb','4575b4'];
+var palBSI  = ['08306b','2171b5','6baed6','fdd49e','fdae61','d73027','7f0000'];
+var palDust = ['2c7bb6','abd9e9','ffffbf','fdae61','d7191c'];
+
+// RGB más contrastado
+var visRGB = {bands:['B4','B3','B2'], min:0.03, max:0.30, gamma:1.2};
+
+// Índices con paleta
+var visNDVI = {min:-0.1, max:0.8, palette: palNDVI};
+var visNDMI = {min:-0.5, max:0.5, palette: palNDMI};
+var visBSI  = {min:-0.4, max:0.4, palette: palBSI};
+
+// Erodible (periodo completo) con relleno y borde
+var erodibleFill = erodible.visualize({palette: ['ff00ff'], opacity: 0.55});
+var erodibleEdge = erodible.focal_max(1).subtract(erodible).selfMask()
+  .visualize({palette: ['000000'], opacity: 0.9});
+
+// Capas base
+Map.addLayer(comp, visRGB, 'S2 RGB (mediana periodo)', true);
+Map.addLayer(comp.select('NDVI'), visNDVI, 'NDVI (periodo)', false);
+Map.addLayer(comp.select('NDMI'), visNDMI, 'NDMI (periodo)', false);
+Map.addLayer(comp.select('BSI'),  visBSI,  'BSI (periodo)', false);
+
+// DUST (periodo) con percentiles p2/p98 (client-side)
+(function addDustPeriod() {
+  var dustP = comp.select('DUST_POT');
+
+  var pct = dustP.reduceRegion({
+    reducer: ee.Reducer.percentile([2, 98]),
+    geometry: roi,
+    scale: 20,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+
+  pct.evaluate(function(p) {
+    var vmin = (p && p.DUST_POT_p2 !== null && p.DUST_POT_p2 !== undefined) ? p.DUST_POT_p2 : 0.0;
+    var vmax = (p && p.DUST_POT_p98 !== null && p.DUST_POT_p98 !== undefined) ? p.DUST_POT_p98 : 0.25;
+    if (vmin === vmax) { vmax = vmin + 0.01; }
+
+    Map.addLayer(dustP, {min: vmin, max: vmax, palette: palDust}, 'DUST_POT (periodo) p2/p98', true);
+  });
+})();
+
+Map.addLayer(erodibleFill, {}, 'Erodible (periodo) relleno', false);
+Map.addLayer(erodibleEdge, {}, 'Erodible (periodo) borde', false);
+
+//---------------------------------------------
+// 5) Tabla + gráficos globales (toda la serie)
+//---------------------------------------------
+var years = ee.List.sequence(2019, 2025);
+
+function yearMetrics(y) {
+  y = ee.Number(y);
+  var yStart = ee.Date.fromYMD(y,1,1);
+  var yEnd   = yStart.advance(1,'year');
+
+  var yc = s2.filterDate(yStart, yEnd).median().clip(roi);
+
+  var yErodible = yc.select('NDVI').lte(thrNDVI)
+    .and(yc.select('NDMI').lte(thrNDMI))
+    .and(yc.select('BSI').gte(thrBSI))
+    .selfMask();
+
+  // Área erosionable (ha)
+  var areaHa = ee.Image.pixelArea().updateMask(yErodible)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: roi,
+      scale: 10,
+      maxPixels: 1e13
+    }).get('area');
+
+  areaHa = ee.Number(areaHa).divide(10000);
+
+  // Promedio potencial de polvo
+  var meanDust = yc.select('DUST_POT').reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: 20,
+    maxPixels: 1e13
+  }).get('DUST_POT');
+
+  return ee.Feature(null, {
+    year: y,
+    erodible_ha: areaHa,
+    dust_pot_mean: meanDust
+  });
+}
+
+var table = ee.FeatureCollection(years.map(yearMetrics));
+print('Resumen anual (proxy erosión eólica)', table);
+
+var chartArea = ui.Chart.feature.byFeature(table, 'year', 'erodible_ha')
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Área erosionable (ha) por año (serie completa)',
+    hAxis: {title: 'Año'},
+    vAxis: {title: 'ha'},
+    pointSize: 4
+  });
+print(chartArea);
+
+var chartDust = ui.Chart.feature.byFeature(table, 'year', 'dust_pot_mean')
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Potencial de emisión de polvo (promedio) por año (serie completa)',
+    hAxis: {title: 'Año'},
+    vAxis: {title: 'proxy'},
+    pointSize: 4
+  });
+print(chartDust);
+
+// =====================================================
+// 6) UI INTERACTIVA: año + botón + KPIs + gráficos adaptativos
+// =====================================================
+
+// Años disponibles (client-side para UI)
+var yearsList = ee.List.sequence(2019, 2025).getInfo();
+
+// Panel UI
+var panel = ui.Panel({style: {position: 'top-left', padding: '10px', width: '340px'}});
+panel.add(ui.Label('Visor por año (proxy erosión eólica)', {
+  fontWeight: 'bold', fontSize: '13px', margin: '0 0 8px 0'
+}));
+
+var yearSelect = ui.Select({
+  items: yearsList.map(function(y){ return String(y); }),
+  value: String(yearsList[yearsList.length - 1]),
+  style: {stretch: 'horizontal'}
+});
+
+var btn = ui.Button({
+  label: 'Actualizar mapa y KPIs',
+  style: {stretch: 'horizontal', margin: '8px 0 0 0'}
+});
+
+var status = ui.Label('', {margin: '8px 0 0 0', fontSize: '11px', color: '555555'});
+
+panel.add(ui.Label('Selecciona año:', {margin: '0 0 4px 0'}));
+panel.add(yearSelect);
+panel.add(btn);
+panel.add(status);
+
+// KPIs
+var kpiPanel = ui.Panel({
+  style: {margin: '10px 0 0 0', padding: '10px', border: '1px solid #dddddd', backgroundColor: 'ffffff'}
+});
+kpiPanel.add(ui.Label('Indicadores (año seleccionado)', {fontWeight: 'bold', margin: '0 0 8px 0'}));
+var kpiArea = ui.Label('Área erosionable (ha): —', {fontSize: '12px', margin: '0 0 4px 0'});
+var kpiDust = ui.Label('Dust proxy (promedio): —', {fontSize: '12px'});
+kpiPanel.add(kpiArea);
+kpiPanel.add(kpiDust);
+panel.add(kpiPanel);
+
+// Charts adaptativos
+panel.add(ui.Label('Gráficos (hasta el año seleccionado)', {fontWeight: 'bold', margin: '10px 0 6px 0'}));
+var chartPanel = ui.Panel({style: {padding: '0 0 0 0'}});
+panel.add(chartPanel);
+
+Map.add(panel);
+
+// Referencias a capas para reemplazarlas sin acumular
+var lyrRGB = null;
+var lyrDust = null;
+var lyrErodFill = null;
+var lyrErodEdge = null;
+
+// Métricas para armar FC de charts (hasta el año seleccionado)
+function metricsForYear(y) {
+  y = ee.Number(y);
+  var yStart = ee.Date.fromYMD(y,1,1);
+  var yEnd   = yStart.advance(1,'year');
+
+  var yc = s2.filterDate(yStart, yEnd).median().clip(roi);
+
+  var yErodible = yc.select('NDVI').lte(thrNDVI)
+    .and(yc.select('NDMI').lte(thrNDMI))
+    .and(yc.select('BSI').gte(thrBSI))
+    .selfMask()
+    .rename('ERODIBLE');
+
+  var areaHa = ee.Image.pixelArea().updateMask(yErodible)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: roi,
+      scale: 10,
+      maxPixels: 1e13,
+      bestEffort: true
+    }).get('area');
+
+  areaHa = ee.Number(areaHa).divide(10000);
+
+  var meanDust = yc.select('DUST_POT').reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: 20,
+    maxPixels: 1e13,
+    bestEffort: true
+  }).get('DUST_POT');
+
+  return ee.Feature(null, {year: y, erodible_ha: areaHa, dust_pot_mean: meanDust});
+}
+
+// Actualiza gráficos hasta el año seleccionado
+function updateChartsUptoYear(yearInt) {
+  chartPanel.clear();
+
+  var upto = ee.List.sequence(2019, yearInt);
+  var fc = ee.FeatureCollection(upto.map(metricsForYear));
+
+  var c1 = ui.Chart.feature.byFeature(fc, 'year', 'erodible_ha')
+    .setChartType('LineChart')
+    .setOptions({
+      title: 'Área erosionable (ha) hasta ' + yearInt,
+      hAxis: {title: 'Año'},
+      vAxis: {title: 'ha'},
+      pointSize: 4
+    });
+
+  var c2 = ui.Chart.feature.byFeature(fc, 'year', 'dust_pot_mean')
+    .setChartType('LineChart')
+    .setOptions({
+      title: 'Potencial de polvo (promedio) hasta ' + yearInt,
+      hAxis: {title: 'Año'},
+      vAxis: {title: 'proxy'},
+      pointSize: 4
+    });
+
+  chartPanel.add(c1);
+  chartPanel.add(c2);
+}
+
+// Actualiza mapa + KPIs para el año seleccionado
+function updateMapAndKPIsForYear(yearInt) {
+  var y = ee.Number(yearInt);
+  var yStart = ee.Date.fromYMD(y,1,1);
+  var yEnd   = yStart.advance(1,'year');
+
+  var yc = s2.filterDate(yStart, yEnd).median().clip(roi);
+
+  var yErodible = yc.select('NDVI').lte(thrNDVI)
+    .and(yc.select('NDMI').lte(thrNDMI))
+    .and(yc.select('BSI').gte(thrBSI))
+    .selfMask();
+
+  var erodFillImg = yErodible.visualize({palette: ['ff00ff'], opacity: 0.55});
+  var erodEdgeImg = yErodible.focal_max(1).subtract(yErodible).selfMask()
+    .visualize({palette: ['000000'], opacity: 0.9});
+
+  var dust = yc.select('DUST_POT');
+
+  // Percentiles dust + KPIs (todo en un diccionario server-side -> evaluate)
+  var pct = dust.reduceRegion({
+    reducer: ee.Reducer.percentile([2, 98]),
+    geometry: roi,
+    scale: 20,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+
+  var areaHa = ee.Image.pixelArea().updateMask(yErodible)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: roi,
+      scale: 10,
+      maxPixels: 1e13,
+      bestEffort: true
+    }).get('area');
+  areaHa = ee.Number(areaHa).divide(10000);
+
+  var meanDust = dust.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: 20,
+    maxPixels: 1e13,
+    bestEffort: true
+  }).get('DUST_POT');
+
+  ee.Dictionary({pct: pct, areaHa: areaHa, meanDust: meanDust}).evaluate(function(out) {
+    // Percentiles
+    var p = out.pct;
+    var vmin = (p && p.DUST_POT_p2 !== null && p.DUST_POT_p2 !== undefined) ? p.DUST_POT_p2 : 0.0;
+    var vmax = (p && p.DUST_POT_p98 !== null && p.DUST_POT_p98 !== undefined) ? p.DUST_POT_p98 : 0.25;
+    if (vmin === vmax) { vmax = vmin + 0.01; }
+
+    var visDustLocal = {min: vmin, max: vmax, palette: palDust};
+
+    // KPIs
+    var areaVal = out.areaHa;
+    var dustVal = out.meanDust;
+
+    var areaTxt = (areaVal === null || areaVal === undefined) ? '—' : Number(areaVal).toFixed(2);
+    var dustTxt = (dustVal === null || dustVal === undefined) ? '—' : Number(dustVal).toFixed(4);
+
+    kpiArea.setValue('Área erosionable (ha): ' + areaTxt);
+    kpiDust.setValue('Dust proxy (promedio): ' + dustTxt);
+
+    // Remover capas anteriores
+    if (lyrRGB) Map.layers().remove(lyrRGB);
+    if (lyrDust) Map.layers().remove(lyrDust);
+    if (lyrErodFill) Map.layers().remove(lyrErodFill);
+    if (lyrErodEdge) Map.layers().remove(lyrErodEdge);
+
+    // Crear nuevas capas
+    lyrRGB = ui.Map.Layer(yc, visRGB, 'S2 RGB ' + yearInt, true);
+    lyrDust = ui.Map.Layer(dust, visDustLocal, 'DUST_POT ' + yearInt + ' (p2/p98)', true);
+    lyrErodFill = ui.Map.Layer(erodFillImg, {}, 'Erodible ' + yearInt, true);
+    lyrErodEdge = ui.Map.Layer(erodEdgeImg, {}, 'Borde erodible ' + yearInt, true);
+
+    // Insertar capas arriba (orden)
+    Map.layers().insert(0, lyrRGB);
+    Map.layers().insert(1, lyrDust);
+    Map.layers().insert(2, lyrErodFill);
+    Map.layers().insert(3, lyrErodEdge);
+
+    status.setValue('Actualizado: ' + yearInt);
+  });
+}
+
+// Botón: actualizar todo
+btn.onClick(function() {
+  var y = parseInt(yearSelect.getValue(), 10);
+  status.setValue('Calculando ' + y + ' ...');
+  updateMapAndKPIsForYear(y);
+  updateChartsUptoYear(y);
+});
+
+// Inicialización
+(function init() {
+  var y0 = parseInt(yearSelect.getValue(), 10);
+  updateMapAndKPIsForYear(y0);
+  updateChartsUptoYear(y0);
+})();
+
+//---------------------------------------------
+// 7) (Opcional) Exportar raster de potencial
+//---------------------------------------------
+// Export.image.toDrive({
+//   image: comp.select('DUST_POT'),
+//   description: 'DustPotential_S2_median_2019_2025',
+//   region: roi,
+//   scale: 10,
+//   maxPixels: 1e13
+// });
